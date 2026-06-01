@@ -1,0 +1,5 @@
+{
+  "name": "Ibot",
+  "description": "The ibot frontend shell for authenticated chat and admin knowledge operations backed by the Java API.",
+  "requestFramePermissions": []
+}

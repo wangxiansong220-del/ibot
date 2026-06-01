@@ -1,0 +1,697 @@
+<script setup lang="ts">
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import {
+  CheckCircle2,
+  Database,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Search,
+  Shield,
+  Upload,
+  Users,
+  Workflow,
+  Wrench,
+} from "lucide-vue-next";
+import {
+  createDataSource,
+  createUser,
+  deleteDataSource,
+  deleteKnowledgeDocument,
+  deleteUser,
+  getRagStatus,
+  getRebuildTask,
+  getSettings,
+  getTask,
+  listDataSources,
+  listKnowledgeDocuments,
+  listTasks,
+  listUsers,
+  rebuildKnowledgeBase,
+  resetUserPassword,
+  testDataSource,
+  type AdminSettings,
+  type AdminTask,
+  type DataSource,
+  type DataSourcePayload,
+  type KnowledgeDocument,
+  type RagStatus,
+  type RebuildResponse,
+  type UserProfileItem,
+  updateDataSource,
+  updateSettings,
+  updateUser,
+  uploadKnowledgeDocuments,
+} from "../services/admin";
+import { ApiError } from "../services/api";
+
+const props = defineProps<{
+  view: "knowledge" | "datasource" | "monitor" | "users" | "settings";
+}>();
+
+const knowledgeBase = ref("default");
+const knowledgeDocuments = ref<KnowledgeDocument[]>([]);
+const ragStatus = ref<RagStatus | null>(null);
+const latestRebuild = ref<RebuildResponse | null>(null);
+const selectedFiles = ref<File[]>([]);
+const uploadBusy = ref(false);
+const rebuildBusy = ref(false);
+const viewBusy = ref(false);
+const panelMessage = ref("");
+const panelError = ref("");
+
+const dataSources = ref<DataSource[]>([]);
+const editingDataSourceId = ref<number | null>(null);
+const dataSourceForm = ref<DataSourcePayload>({
+  name: "",
+  type: "MYSQL",
+  host: "127.0.0.1",
+  port: 3306,
+  databaseName: "",
+  username: "",
+  password: "",
+  apiBaseUrl: "",
+  notes: "",
+  enabled: true,
+});
+
+const users = ref<UserProfileItem[]>([]);
+const createUserForm = ref({
+  email: "",
+  displayName: "",
+  password: "",
+  role: "USER" as "USER" | "ADMIN",
+});
+const tasks = ref<AdminTask[]>([]);
+const selectedTask = ref<AdminTask | null>(null);
+const settings = ref<AdminSettings | null>(null);
+const settingsForm = ref({
+  chatModelName: "qwen-max",
+  defaultKnowledgeBase: "default",
+  retrievalMaxResults: 3,
+  retrievalMinScore: 0.6,
+  uploadMaxSizeMb: 20,
+});
+
+const dataSourceTypeOptions = ["MYSQL", "POSTGRESQL", "MONGODB", "ELASTICSEARCH", "REDIS", "API_ENDPOINT"] as const;
+let rebuildPollTimer: number | null = null;
+
+function setError(error: unknown, fallback: string) {
+  panelError.value = error instanceof ApiError ? error.message : fallback;
+}
+
+async function loadSettingsPanel() {
+  const response = await getSettings();
+  settings.value = response;
+  settingsForm.value = {
+    chatModelName: response.chatModelName,
+    defaultKnowledgeBase: response.defaultKnowledgeBase,
+    retrievalMaxResults: response.retrievalMaxResults,
+    retrievalMinScore: response.retrievalMinScore,
+    uploadMaxSizeMb: response.uploadMaxSizeMb,
+  };
+  if (!knowledgeBase.value || knowledgeBase.value === "default") {
+    knowledgeBase.value = response.defaultKnowledgeBase || "default";
+  }
+}
+
+async function loadKnowledgePanel() {
+  const [documents, status] = await Promise.all([
+    listKnowledgeDocuments(knowledgeBase.value),
+    getRagStatus(knowledgeBase.value),
+  ]);
+  knowledgeDocuments.value = documents;
+  ragStatus.value = status;
+}
+
+async function loadDataSourcePanel() {
+  dataSources.value = await listDataSources();
+}
+
+async function loadUsersPanel() {
+  users.value = await listUsers();
+}
+
+async function loadTasksPanel() {
+  tasks.value = await listTasks();
+}
+
+async function refreshCurrentView() {
+  panelError.value = "";
+  panelMessage.value = "";
+  viewBusy.value = true;
+
+  try {
+    if (!settings.value || props.view === "settings") {
+      await loadSettingsPanel();
+    }
+
+    if (props.view === "knowledge") {
+      await loadKnowledgePanel();
+    } else if (props.view === "datasource") {
+      await loadDataSourcePanel();
+    } else if (props.view === "users") {
+      await loadUsersPanel();
+    } else if (props.view === "monitor") {
+      await loadTasksPanel();
+    }
+  } catch (error) {
+    setError(error, "当前管理模块加载失败。");
+  } finally {
+    viewBusy.value = false;
+  }
+}
+
+async function handleUpload() {
+  if (!selectedFiles.value.length) {
+    panelError.value = "请先选择文件后再上传。";
+    return;
+  }
+
+  uploadBusy.value = true;
+  panelError.value = "";
+  panelMessage.value = "";
+
+  try {
+    const response = await uploadKnowledgeDocuments(knowledgeBase.value, selectedFiles.value);
+    selectedFiles.value = [];
+    panelMessage.value = response.message || `已向 ${response.knowledgeBase} 上传 ${response.uploadedCount} 个文档。`;
+    await loadKnowledgePanel();
+    await loadTasksPanel();
+  } catch (error) {
+    setError(error, "文档上传失败。");
+  } finally {
+    uploadBusy.value = false;
+  }
+}
+
+async function handleDeleteDocument(documentId: string) {
+  try {
+    const response = await deleteKnowledgeDocument(knowledgeBase.value, documentId);
+    panelMessage.value = response.message || "文档删除成功。";
+    await loadKnowledgePanel();
+    await loadTasksPanel();
+  } catch (error) {
+    setError(error, "无法删除该文档。");
+  }
+}
+
+async function handleRebuild() {
+  rebuildBusy.value = true;
+  panelError.value = "";
+  panelMessage.value = "";
+
+  try {
+    latestRebuild.value = await rebuildKnowledgeBase(knowledgeBase.value);
+    panelMessage.value = "知识库重建任务已启动。";
+    startRebuildPolling();
+    await loadTasksPanel();
+  } catch (error) {
+    setError(error, "暂时无法启动重建任务。");
+  } finally {
+    rebuildBusy.value = false;
+  }
+}
+
+async function refreshRebuildTask() {
+  if (!latestRebuild.value?.taskId) {
+    return;
+  }
+
+  try {
+    latestRebuild.value = await getRebuildTask(latestRebuild.value.taskId);
+    if (latestRebuild.value.status === "COMPLETED" || latestRebuild.value.status === "FAILED") {
+      stopRebuildPolling();
+    }
+    await loadTasksPanel();
+  } catch (error) {
+    stopRebuildPolling();
+    setError(error, "无法刷新重建进度。");
+  }
+}
+
+function stopRebuildPolling() {
+  if (rebuildPollTimer !== null) {
+    window.clearInterval(rebuildPollTimer);
+    rebuildPollTimer = null;
+  }
+}
+
+function startRebuildPolling() {
+  stopRebuildPolling();
+  rebuildPollTimer = window.setInterval(() => {
+    refreshRebuildTask().catch(() => undefined);
+  }, 3000);
+}
+
+function resetDataSourceForm() {
+  editingDataSourceId.value = null;
+  dataSourceForm.value = {
+    name: "",
+    type: "MYSQL",
+    host: "127.0.0.1",
+    port: 3306,
+    databaseName: "",
+    username: "",
+    password: "",
+    apiBaseUrl: "",
+    notes: "",
+    enabled: true,
+  };
+}
+
+async function submitDataSource() {
+  try {
+    if (editingDataSourceId.value) {
+      await updateDataSource(editingDataSourceId.value, dataSourceForm.value);
+      panelMessage.value = "数据源更新成功。";
+    } else {
+      await createDataSource(dataSourceForm.value);
+      panelMessage.value = "数据源创建成功。";
+    }
+    resetDataSourceForm();
+    await loadDataSourcePanel();
+    await loadTasksPanel();
+  } catch (error) {
+    setError(error, "无法保存数据源配置。");
+  }
+}
+
+function startEditDataSource(item: DataSource) {
+  editingDataSourceId.value = item.id;
+  dataSourceForm.value = {
+    name: item.name,
+    type: item.type,
+    host: item.host,
+    port: item.port,
+    databaseName: item.databaseName,
+    username: item.username,
+    password: "",
+    apiBaseUrl: item.apiBaseUrl,
+    notes: item.notes,
+    enabled: item.enabled,
+  };
+}
+
+async function removeDataSource(id: number) {
+  try {
+    await deleteDataSource(id);
+    panelMessage.value = "数据源已删除。";
+    await loadDataSourcePanel();
+  } catch (error) {
+    setError(error, "无法删除该数据源。");
+  }
+}
+
+async function runDataSourceTest(id: number) {
+  try {
+    const result = await testDataSource(id);
+    panelMessage.value = result.message;
+    await loadDataSourcePanel();
+    await loadTasksPanel();
+  } catch (error) {
+    setError(error, "连接测试失败。");
+  }
+}
+
+async function submitUser() {
+  try {
+    await createUser(createUserForm.value);
+    createUserForm.value = {
+      email: "",
+      displayName: "",
+      password: "",
+      role: "USER",
+    };
+    panelMessage.value = "用户创建成功。";
+    await loadUsersPanel();
+  } catch (error) {
+    setError(error, "无法创建用户。");
+  }
+}
+
+async function toggleUserEnabled(user: UserProfileItem) {
+  try {
+    await updateUser(user.id, { enabled: !user.enabled });
+    await loadUsersPanel();
+  } catch (error) {
+    setError(error, "无法更新账号状态。");
+  }
+}
+
+async function toggleUserRole(user: UserProfileItem) {
+  try {
+    await updateUser(user.id, { role: user.role === "ADMIN" ? "USER" : "ADMIN" });
+    await loadUsersPanel();
+  } catch (error) {
+    setError(error, "无法更新用户角色。");
+  }
+}
+
+async function handleResetPassword(user: UserProfileItem) {
+  const nextPassword = window.prompt(`请为 ${user.email} 设置新密码`);
+  if (!nextPassword) {
+    return;
+  }
+
+  try {
+    await resetUserPassword(user.id, nextPassword);
+    panelMessage.value = `${user.email} 的密码已更新。`;
+  } catch (error) {
+    setError(error, "无法重置该用户密码。");
+  }
+}
+
+async function handleSaveSettings() {
+  try {
+    settings.value = await updateSettings(settingsForm.value);
+    knowledgeBase.value = settingsForm.value.defaultKnowledgeBase;
+    panelMessage.value = "系统设置保存成功。";
+  } catch (error) {
+    setError(error, "无法保存系统设置。");
+  }
+}
+
+async function handleDeleteUser(user: UserProfileItem) {
+  const confirmed = window.confirm(`确认删除用户 ${user.email} 吗？此操作不可撤销。`);
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const response = await deleteUser(user.id);
+    panelMessage.value = response.message || `已删除 ${user.email}`;
+    await loadUsersPanel();
+  } catch (error) {
+    setError(error, "无法删除该用户。");
+  }
+}
+
+function refreshSelectedTask() {
+  if (!selectedTask.value) {
+    return;
+  }
+
+  getTask(selectedTask.value.id)
+    .then((task) => {
+      selectedTask.value = task;
+    })
+    .catch((error) => {
+      setError(error, "无法刷新该任务详情。");
+    });
+}
+
+watch(
+  () => props.view,
+  () => {
+    refreshCurrentView();
+  },
+  { immediate: true }
+);
+
+watch(knowledgeBase, () => {
+  if (props.view === "knowledge" && settings.value) {
+    loadKnowledgePanel().catch((error) => setError(error, "无法刷新当前知识库数据。"));
+  }
+});
+
+onMounted(async () => {
+  await loadTasksPanel().catch(() => undefined);
+});
+
+onBeforeUnmount(() => {
+  stopRebuildPolling();
+});
+</script>
+
+<template>
+  <div class="flex h-full flex-col bg-surface overflow-hidden">
+    <header class="flex items-center justify-between border-b border-outline-variant/10 px-8 py-5">
+      <div>
+        <p class="text-[11px] uppercase tracking-[0.28em] text-on-surface-variant">管理工作台</p>
+        <h2 class="mt-2 text-2xl font-medium tracking-tight text-on-surface">在同一界面内完成系统管理与知识维护。</h2>
+      </div>
+      <button class="inline-flex items-center gap-2 rounded-full border border-outline-variant/20 px-4 py-2 text-xs uppercase tracking-[0.22em] text-on-surface-variant transition hover:bg-surface-container-low hover:text-on-surface" @click="refreshCurrentView">
+        <RefreshCw class="h-3.5 w-3.5" />
+        刷新
+      </button>
+    </header>
+
+    <div class="flex-1 px-8 py-8 overflow-hidden flex flex-col">
+      <div class="mx-auto max-w-6xl w-full flex-1 min-h-0 flex flex-col space-y-6">
+        <div v-if="panelError" class="rounded-3xl bg-red-500/10 px-5 py-4 text-sm text-red-300">{{ panelError }}</div>
+        <div v-if="panelMessage" class="rounded-3xl bg-emerald-500/10 px-5 py-4 text-sm text-emerald-300">{{ panelMessage }}</div>
+
+        <div v-if="viewBusy" class="flex items-center gap-3 rounded-3xl bg-surface-container-low px-5 py-4 text-sm text-on-surface-variant">
+          <Loader2 class="h-4 w-4 animate-spin" />
+          正在加载管理数据...
+        </div>
+
+        <template v-else>
+          <section v-if="view === 'knowledge'" class="space-y-6 overflow-y-auto flex-1 min-h-0">
+            <div class="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
+              <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+                <div class="flex items-start justify-between gap-4">
+                  <div>
+                    <p class="text-[11px] uppercase tracking-[0.24em] text-on-surface-variant">知识库</p>
+                    <h3 class="mt-2 text-xl font-medium text-on-surface">文档导入</h3>
+                  </div>
+                  <div class="rounded-full bg-surface px-3 py-1 text-xs text-on-surface-variant">{{ knowledgeDocuments.length }} 个文档</div>
+                </div>
+                <div class="mt-5 grid gap-4 md:grid-cols-[0.8fr_1.2fr]">
+                  <label class="space-y-2">
+                    <span class="text-xs uppercase tracking-[0.24em] text-on-surface-variant">知识库标识</span>
+                    <input v-model="knowledgeBase" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" />
+                  </label>
+                  <label class="space-y-2">
+                    <span class="text-xs uppercase tracking-[0.24em] text-on-surface-variant">文件选择</span>
+                    <input type="file" multiple class="w-full rounded-2xl bg-surface px-4 py-3 text-sm text-on-surface-variant" @change="selectedFiles = Array.from(($event.target as HTMLInputElement).files || [])" />
+                  </label>
+                </div>
+                <div class="mt-5 flex flex-wrap gap-3">
+                  <button class="inline-flex items-center gap-2 rounded-full bg-on-surface px-5 py-2.5 text-sm text-surface transition hover:opacity-90 disabled:opacity-60" :disabled="uploadBusy" @click="handleUpload">
+                    <Upload class="h-4 w-4" />
+                    {{ uploadBusy ? '上传中...' : '上传文档' }}
+                  </button>
+                  <button class="inline-flex items-center gap-2 rounded-full border border-outline-variant/20 px-5 py-2.5 text-sm text-on-surface transition hover:bg-surface" :disabled="rebuildBusy" @click="handleRebuild">
+                    <RotateCcw class="h-4 w-4" />
+                    {{ rebuildBusy ? '启动中...' : '重建知识库' }}
+                  </button>
+                  <button v-if="latestRebuild?.taskId" class="inline-flex items-center gap-2 rounded-full border border-outline-variant/20 px-5 py-2.5 text-sm text-on-surface-variant transition hover:bg-surface hover:text-on-surface" @click="refreshRebuildTask">
+                    <RefreshCw class="h-4 w-4" />
+                    刷新重建进度
+                  </button>
+                </div>
+              </div>
+
+              <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+                <p class="text-[11px] uppercase tracking-[0.24em] text-on-surface-variant">RAG 状态</p>
+                <div class="mt-4 grid gap-3 sm:grid-cols-2">
+                  <div class="rounded-2xl bg-surface px-4 py-3">
+                    <p class="text-xs text-on-surface-variant">服务提供方</p>
+                    <p class="mt-2 text-sm leading-6 text-on-surface break-words">{{ ragStatus?.embeddingProvider || '--' }}</p>
+                  </div>
+                  <div class="rounded-2xl bg-surface px-4 py-3">
+                    <p class="text-xs text-on-surface-variant">向量存储</p>
+                    <p class="mt-2 text-sm leading-6 text-on-surface break-words">{{ ragStatus?.vectorStore || '--' }}</p>
+                  </div>
+                  <div class="rounded-2xl bg-surface px-4 py-3 sm:col-span-2">
+                    <p class="text-xs text-on-surface-variant">检索状态</p>
+                    <p class="mt-2 text-sm leading-6 text-on-surface break-all">{{ ragStatus?.retrievalStatus || '--' }}</p>
+                  </div>
+                  <div class="rounded-2xl bg-surface px-4 py-3 sm:col-span-2">
+                    <p class="text-xs text-on-surface-variant">分块参数</p>
+                    <p class="mt-2 text-sm leading-6 text-on-surface">{{ ragStatus?.chunkSize || '--' }} / {{ ragStatus?.chunkOverlap || '--' }}</p>
+                  </div>
+                </div>
+                <div v-if="latestRebuild" class="mt-6 rounded-2xl bg-surface px-4 py-4">
+                  <div class="flex items-center justify-between gap-4">
+                    <div>
+                      <p class="text-sm font-medium text-on-surface">最近一次重建</p>
+                      <p class="mt-1 text-xs text-on-surface-variant">{{ latestRebuild.status }} · {{ latestRebuild.message || '任务执行中' }}</p>
+                    </div>
+                    <span class="text-sm text-on-surface">{{ latestRebuild.progress }}%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center justify-between gap-4">
+                <div>
+                  <p class="text-[11px] uppercase tracking-[0.24em] text-on-surface-variant">文档列表</p>
+                  <h3 class="mt-2 text-xl font-medium text-on-surface">已索引内容</h3>
+                </div>
+                <div class="inline-flex items-center gap-2 rounded-full bg-surface px-3 py-1 text-xs text-on-surface-variant"><Search class="h-3.5 w-3.5" />{{ knowledgeBase }}</div>
+              </div>
+              <div class="mt-5 overflow-hidden rounded-3xl border border-outline-variant/10">
+                <table class="min-w-full text-left text-sm">
+                  <thead class="bg-surface text-on-surface-variant"><tr><th class="px-4 py-3 font-medium">文件名</th><th class="px-4 py-3 font-medium">分块数</th><th class="px-4 py-3 font-medium">状态</th><th class="px-4 py-3 font-medium text-right">操作</th></tr></thead>
+                  <tbody>
+                    <tr v-if="knowledgeDocuments.length === 0"><td colspan="4" class="px-4 py-8 text-center text-on-surface-variant">暂无文档。</td></tr>
+                    <tr v-for="document in knowledgeDocuments" :key="document.documentId" class="border-t border-outline-variant/10">
+                      <td class="px-4 py-4"><p class="font-medium text-on-surface">{{ document.fileName }}</p><p class="mt-1 text-xs text-on-surface-variant">{{ document.storagePath }}</p></td>
+                      <td class="px-4 py-4 text-on-surface">{{ document.chunkCount }}</td>
+                      <td class="px-4 py-4 text-on-surface-variant">{{ document.indexingStatus }}</td>
+                      <td class="px-4 py-4 text-right"><button class="rounded-full px-3 py-1.5 text-xs text-red-300 transition hover:bg-red-500/10" @click="handleDeleteDocument(document.documentId)">删除</button></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section v-else-if="view === 'datasource'" class="grid gap-6 xl:grid-cols-[0.9fr_1.1fr] overflow-y-auto flex-1 min-h-0">
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center gap-3"><Database class="h-5 w-5 text-on-surface-variant" /><h3 class="text-xl font-medium text-on-surface">{{ editingDataSourceId ? '编辑数据源' : '新建数据源' }}</h3></div>
+              <p class="mt-3 text-sm leading-6 text-on-surface-variant">在这里维护业务系统、数据库或外部接口连接，后续可作为知识增强或结构化查询的数据来源。</p>
+              <div class="mt-5 grid gap-4">
+                <input v-model="dataSourceForm.name" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="数据源名称" />
+                <select v-model="dataSourceForm.type" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none"><option v-for="type in dataSourceTypeOptions" :key="type" :value="type">{{ type }}</option></select>
+                <div class="grid gap-4 md:grid-cols-2">
+                  <input v-model="dataSourceForm.host" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="主机地址" />
+                  <input v-model.number="dataSourceForm.port" type="number" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="端口" />
+                </div>
+                <input v-model="dataSourceForm.databaseName" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="数据库名称" />
+                <input v-model="dataSourceForm.apiBaseUrl" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="接口基础地址" />
+                <div class="grid gap-4 md:grid-cols-2">
+                  <input v-model="dataSourceForm.username" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="用户名" />
+                  <input v-model="dataSourceForm.password" type="password" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="密码" />
+                </div>
+                <textarea v-model="dataSourceForm.notes" rows="4" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="备注说明"></textarea>
+                <label class="inline-flex items-center gap-3 text-sm text-on-surface-variant"><input v-model="dataSourceForm.enabled" type="checkbox" class="h-4 w-4 rounded border-outline-variant/30 bg-surface" />启用该数据源</label>
+                <div class="flex gap-3">
+                  <button class="inline-flex items-center gap-2 rounded-full bg-on-surface px-5 py-2.5 text-sm text-surface transition hover:opacity-90" @click="submitDataSource"><Save class="h-4 w-4" />{{ editingDataSourceId ? '保存修改' : '创建数据源' }}</button>
+                  <button class="rounded-full border border-outline-variant/20 px-5 py-2.5 text-sm text-on-surface-variant transition hover:bg-surface" @click="resetDataSourceForm">清空表单</button>
+                </div>
+              </div>
+            </div>
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center gap-3"><Wrench class="h-5 w-5 text-on-surface-variant" /><h3 class="text-xl font-medium text-on-surface">已配置数据源</h3></div>
+              <div class="mt-5 space-y-4">
+                <div v-if="dataSources.length === 0" class="rounded-2xl bg-surface px-4 py-6 text-center text-sm text-on-surface-variant">当前还没有配置任何数据源。</div>
+                <div v-for="item in dataSources" :key="item.id" class="rounded-3xl bg-surface px-5 py-5">
+                  <div class="flex items-start justify-between gap-4">
+                    <div><p class="text-sm font-medium text-on-surface">{{ item.name }}</p><p class="mt-1 text-xs text-on-surface-variant">{{ item.type }} · {{ item.host || item.apiBaseUrl || '--' }}</p></div>
+                    <span class="rounded-full px-2.5 py-1 text-[11px]" :class="item.enabled ? 'bg-emerald-500/10 text-emerald-300' : 'bg-white/5 text-on-surface-variant'">{{ item.enabled ? '已启用' : '已停用' }}</span>
+                  </div>
+                  <div class="mt-4 flex flex-wrap gap-2 text-xs">
+                    <button class="rounded-full border border-outline-variant/20 px-3 py-1.5 text-on-surface-variant transition hover:bg-surface-container-low hover:text-on-surface" @click="startEditDataSource(item)">编辑</button>
+                    <button class="rounded-full border border-outline-variant/20 px-3 py-1.5 text-on-surface-variant transition hover:bg-surface-container-low hover:text-on-surface" @click="runDataSourceTest(item.id)">测试连接</button>
+                    <button class="rounded-full border border-red-500/20 px-3 py-1.5 text-red-300 transition hover:bg-red-500/10" @click="removeDataSource(item.id)">删除</button>
+                  </div>
+                  <p v-if="item.lastTestMessage" class="mt-3 text-xs text-on-surface-variant">最近测试：{{ item.lastTestMessage }}</p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section v-else-if="view === 'monitor'" class="space-y-6 overflow-y-auto flex-1 min-h-0">
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center gap-3"><Workflow class="h-5 w-5 text-on-surface-variant" /><h3 class="text-xl font-medium text-on-surface">最近任务</h3></div>
+              <div class="mt-5 space-y-3">
+                <div v-if="tasks.length === 0" class="rounded-2xl bg-surface px-4 py-6 text-center text-sm text-on-surface-variant">当前还没有管理任务记录。</div>
+                <button v-for="task in tasks.slice(0, 10)" :key="task.id" class="flex w-full items-center justify-between rounded-3xl bg-surface px-5 py-4 text-left transition hover:bg-surface-container-high" @click="selectedTask = task">
+                  <div><p class="text-sm font-medium text-on-surface">{{ task.taskType }} · {{ task.targetName }}</p><p class="mt-1 text-xs text-on-surface-variant">{{ task.status }} · {{ task.message || '暂无任务说明' }}</p></div>
+                  <span class="text-sm text-on-surface">{{ task.progress }}%</span>
+                </button>
+              </div>
+            </div>
+            <div v-if="selectedTask" class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center justify-between gap-4"><div><p class="text-[11px] uppercase tracking-[0.24em] text-on-surface-variant">任务详情</p><h3 class="mt-2 text-xl font-medium text-on-surface">{{ selectedTask.taskType }}</h3></div><button class="rounded-full border border-outline-variant/20 px-4 py-2 text-xs text-on-surface-variant transition hover:bg-surface" @click="refreshSelectedTask">刷新任务</button></div>
+              <dl class="mt-5 grid gap-4 md:grid-cols-2">
+                <div><dt class="text-xs text-on-surface-variant">目标对象</dt><dd class="mt-1 text-sm text-on-surface">{{ selectedTask.targetType }} / {{ selectedTask.targetName }}</dd></div>
+                <div><dt class="text-xs text-on-surface-variant">任务状态</dt><dd class="mt-1 text-sm text-on-surface">{{ selectedTask.status }}</dd></div>
+                <div><dt class="text-xs text-on-surface-variant">执行进度</dt><dd class="mt-1 text-sm text-on-surface">{{ selectedTask.progress }}%</dd></div>
+                <div><dt class="text-xs text-on-surface-variant">最近更新</dt><dd class="mt-1 text-sm text-on-surface">{{ selectedTask.updatedAt || '--' }}</dd></div>
+              </dl>
+              <p class="mt-5 rounded-2xl bg-surface px-4 py-4 text-sm text-on-surface-variant">{{ selectedTask.message || '暂无任务说明。' }}</p>
+            </div>
+          </section>
+
+          <section v-else-if="view === 'users'" class="grid gap-6 xl:grid-cols-[0.85fr_1.15fr] overflow-hidden flex-1 min-h-0">
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center gap-3"><Users class="h-5 w-5 text-on-surface-variant" /><h3 class="text-xl font-medium text-on-surface">创建用户</h3></div>
+              <div class="mt-5 grid gap-4">
+                <input v-model="createUserForm.displayName" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="显示名称" />
+                <input v-model="createUserForm.email" type="email" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="邮箱" />
+                <input v-model="createUserForm.password" type="password" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="临时密码" />
+                <select v-model="createUserForm.role" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none"><option value="USER">普通用户</option><option value="ADMIN">管理员</option></select>
+                <button class="inline-flex items-center justify-center gap-2 rounded-full bg-on-surface px-5 py-2.5 text-sm text-surface transition hover:opacity-90" @click="submitUser"><Shield class="h-4 w-4" />创建用户</button>
+              </div>
+            </div>
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <h3 class="text-xl font-medium text-on-surface">用户列表</h3>
+              <div class="mt-5 space-y-3">
+                <div v-for="user in users" :key="user.id" class="rounded-3xl bg-surface px-5 py-5">
+                  <div class="flex items-start justify-between gap-4">
+                    <div><p class="text-sm font-medium text-on-surface">{{ user.displayName }}</p><p class="mt-1 text-xs text-on-surface-variant">{{ user.email }}</p></div>
+                    <span class="rounded-full px-2.5 py-1 text-[11px]" :class="user.enabled ? 'bg-emerald-500/10 text-emerald-300' : 'bg-white/5 text-on-surface-variant'">{{ user.enabled ? '已启用' : '已禁用' }}</span>
+                  </div>
+                  <div class="mt-4 flex flex-wrap gap-2 text-xs">
+                    <button class="rounded-full border border-outline-variant/20 px-3 py-1.5 text-on-surface-variant transition hover:bg-surface-container-low hover:text-on-surface" @click="toggleUserRole(user)">切换为{{ user.role === 'ADMIN' ? '普通用户' : '管理员' }}</button>
+                    <button class="rounded-full border border-outline-variant/20 px-3 py-1.5 text-on-surface-variant transition hover:bg-surface-container-low hover:text-on-surface" @click="toggleUserEnabled(user)">{{ user.enabled ? '禁用' : '启用' }}</button>
+                    <button class="rounded-full border border-outline-variant/20 px-3 py-1.5 text-on-surface-variant transition hover:bg-surface-container-low hover:text-on-surface" @click="handleResetPassword(user)">重置密码</button>
+                    <button class="rounded-full border border-red-500/20 px-3 py-1.5 text-red-300 transition hover:bg-red-500/10" @click="handleDeleteUser(user)">删除</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section v-else-if="view === 'settings'" class="grid gap-6 lg:grid-cols-[1fr_0.7fr]">
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center gap-3"><Save class="h-5 w-5 text-on-surface-variant" /><h3 class="text-xl font-medium text-on-surface">系统设置</h3></div>
+              <p class="mt-3 text-sm leading-6 text-on-surface-variant">这里用于控制聊天模型、默认知识库和检索策略。修改后会直接影响用户提问时的检索效果和最终回答内容。</p>
+              <div class="mt-5 grid gap-4">
+                <label class="space-y-2">
+                  <span class="text-sm font-medium text-on-surface">对话模型</span>
+                  <p class="text-xs leading-5 text-on-surface-variant">用于生成最终回答的大模型名称，例如 `qwen-max`。</p>
+                  <input v-model="settingsForm.chatModelName" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="例如：qwen-max" />
+                </label>
+                <label class="space-y-2">
+                  <span class="text-sm font-medium text-on-surface">默认知识库</span>
+                  <p class="text-xs leading-5 text-on-surface-variant">当用户没有主动指定知识库时，系统默认检索的知识库标识。</p>
+                  <input v-model="settingsForm.defaultKnowledgeBase" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="例如：default" />
+                </label>
+                <div class="grid gap-4 md:grid-cols-3">
+                  <label class="space-y-2">
+                    <span class="text-sm font-medium text-on-surface">检索条数</span>
+                    <p class="text-xs leading-5 text-on-surface-variant">每次问答最多取回多少条知识片段参与生成。</p>
+                    <input v-model.number="settingsForm.retrievalMaxResults" type="number" min="1" max="10" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="1 - 10" />
+                  </label>
+                  <label class="space-y-2">
+                    <span class="text-sm font-medium text-on-surface">最低相似度</span>
+                    <p class="text-xs leading-5 text-on-surface-variant">低于该分数的片段不会进入上下文，范围 `0 - 1`。</p>
+                    <input v-model.number="settingsForm.retrievalMinScore" type="number" step="0.05" min="0" max="1" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="例如：0.6" />
+                  </label>
+                  <label class="space-y-2">
+                    <span class="text-sm font-medium text-on-surface">上传大小限制</span>
+                    <p class="text-xs leading-5 text-on-surface-variant">管理员单次上传文件允许的最大体积，单位 MB。</p>
+                    <input v-model.number="settingsForm.uploadMaxSizeMb" type="number" min="1" max="100" class="w-full rounded-2xl bg-surface px-4 py-3 outline-none" placeholder="例如：20" />
+                  </label>
+                </div>
+                <button class="inline-flex items-center justify-center gap-2 rounded-full bg-on-surface px-5 py-2.5 text-sm text-surface transition hover:opacity-90" @click="handleSaveSettings"><Save class="h-4 w-4" />保存设置</button>
+              </div>
+            </div>
+            <div class="rounded-[28px] border border-outline-variant/10 bg-surface-container-low p-6">
+              <div class="flex items-center gap-3"><CheckCircle2 class="h-5 w-5 text-on-surface-variant" /><h3 class="text-xl font-medium text-on-surface">配置状态</h3></div>
+              <div class="mt-5 space-y-4">
+                <div class="rounded-2xl bg-surface px-4 py-4">
+                  <p class="text-xs uppercase tracking-[0.24em] text-on-surface-variant">DashScope</p>
+                  <p class="mt-2 text-sm text-on-surface">{{ settings?.dashscopeApiConfigured ? '已配置' : '缺少密钥' }}</p>
+                  <p class="mt-2 text-xs leading-5 text-on-surface-variant">负责大模型对话与部分向量化能力，未配置时聊天功能会受影响。</p>
+                </div>
+                <div class="rounded-2xl bg-surface px-4 py-4">
+                  <p class="text-xs uppercase tracking-[0.24em] text-on-surface-variant">Pinecone</p>
+                  <p class="mt-2 text-sm text-on-surface">{{ settings?.pineconeApiConfigured ? '已配置' : '缺少密钥' }}</p>
+                  <p class="mt-2 text-xs leading-5 text-on-surface-variant">负责知识片段的向量存储与检索，未配置时 RAG 检索无法正常工作。</p>
+                </div>
+                <div class="rounded-2xl bg-surface px-4 py-4 text-sm leading-6 text-on-surface-variant">这些设置会同步写回后端配置中心，并立即影响后台默认运行参数。建议修改后做一次知识库重建和问答验证。</div>
+              </div>
+            </div>
+          </section>
+        </template>
+      </div>
+ 

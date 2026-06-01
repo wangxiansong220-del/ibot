@@ -1,0 +1,36 @@
+# Node
+node_modules/
+front/node_modules/
+
+# Build output
+front/dist/
+front/build/
+backend/target/
+backend/output/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+**/tmp/
+
+# Environment & secrets
+.env
+.env.local
+backend/src/main/resources/application.properties
+
+# Runtime
+backend/data/
+backend/dev/
+
+# Python cache
+__pycache__/
+*.pyc

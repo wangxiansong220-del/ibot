@@ -1,0 +1,62 @@
+spring.application.name=ibot
+
+# web
+server.port=8080
+server.servlet.encoding.charset=UTF-8
+server.servlet.encoding.enabled=true
+server.servlet.encoding.force=true
+
+# mysql
+spring.datasource.url=jdbc:mysql://127.0.0.1:3306/ibot?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=UTF-8&connectionCollation=utf8mb4_unicode_ci
+spring.datasource.username=root
+spring.datasource.password=YOUR_MYSQL_PASSWORD
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+spring.sql.init.mode=always
+spring.sql.init.schema-locations=classpath:schema-mysql.sql
+mybatis.configuration.map-underscore-to-camel-case=true
+
+# upload
+spring.servlet.multipart.max-file-size=100MB
+spring.servlet.multipart.max-request-size=500MB
+server.tomcat.max-swallow-size=500MB
+
+# dashscope chat model (Qwen)
+langchain4j.community.dashscope.chat-model.api-key=YOUR_DASHSCOPE_API_KEY
+langchain4j.community.dashscope.chat-model.model-name=qwen-max
+langchain4j.community.dashscope.chat-model.base-url=https://dashscope.aliyuncs.com/api/v1
+
+# auth
+ibot.auth.jwt.secret=YOUR_JWT_SECRET_KEY
+ibot.auth.jwt.expire-hours=72
+ibot.auth.seed-admin.email=admin@ibot.local
+ibot.auth.seed-admin.display-name=Ibot Admin
+ibot.auth.seed-admin.password=Admin@123456
+ibot.security.crypto-secret=YOUR_CRYPTO_SECRET
+
+# chat memory
+ibot.chat.memory.max-messages=20
+
+# mongodb
+spring.data.mongodb.uri=mongodb://localhost:27017/ibot
+spring.data.mongodb.auto-index-creation=true
+
+# local knowledge-base storage
+ibot.knowledge.base.storage-root=./data/knowledge-base
+
+# RAG (Dashscope embedding)
+ibot.rag.embedding-provider=dashscope
+ibot.rag.embedding.api-key=${langchain4j.community.dashscope.chat-model.api-key:}
+ibot.rag.embedding.base-url=${langchain4j.community.dashscope.chat-model.base-url:https://dashscope.aliyuncs.com/api/v1}
+ibot.rag.embedding.model-name=text-embedding-v4
+ibot.rag.chunk-size=800
+ibot.rag.chunk-overlap=120
+ibot.rag.default-knowledge-base=default
+ibot.rag.retrieval.max-results=3
+ibot.rag.retrieval.min-score=0.6
+
+# pinecone vector db
+ibot.rag.pinecone.enabled=true
+ibot.rag.pinecone.api-key=YOUR_PINECONE_API_KEY
+ibot.rag.pinecone.index-name=ibot-enterprise-kb
+ibot.rag.pinecone.namespace=ibot-default
+ibot.rag.pinecone.metadata-text-key=text_segment
